@@ -15,6 +15,9 @@ import json
 import os as _os
 import argparse
 from typing import List, Optional, Dict, Any, Callable
+import wandb
+import pandas as pd
+from dotenv import load_dotenv
 from time_series_datasets.TSQADataset import TSQADataset
 from time_series_datasets.m4.M4QADataset import M4QADataset
 from time_series_datasets.sleep.SleepEDFCoTQADataset import SleepEDFCoTQADataset
@@ -71,6 +74,7 @@ CURRICULUM_STAGES = [
     "stage5_ecg_cot",
 ]
 
+load_dotenv()
 
 class CurriculumTrainer:
     """
@@ -115,6 +119,11 @@ class CurriculumTrainer:
         dist_backend: str = "nccl",
         local_rank: int = int(os.environ.get("LOCAL_RANK", 0)),
         llm_id: str = None,
+        wandb_project: str = "opentslm-curriculum",
+        wandb_entity: str = None,
+        wandb_run_name: str = None,
+        wandb_tags: List[str] = None,
+        disable_wandb: bool = False,
     ):
         """
         Initialize the curriculum trainer.
@@ -127,6 +136,11 @@ class CurriculumTrainer:
             dist_backend: Distributed backend
             local_rank: Local GPU rank
             llm_id: LLM model ID (e.g., 'google/medgemma-2b', 'meta-llama/Llama-3.2-1B')
+            wandb_project: Weights & Biases project name
+            wandb_entity: Weights & Biases entity/team name
+            wandb_run_name: Custom run name for wandb
+            wandb_tags: Tags for experiment organization
+            disable_wandb: Disable wandb logging
         """
         self.model_type = model_type
         self.device = device or self._get_device()
@@ -150,7 +164,23 @@ class CurriculumTrainer:
             self._init_distributed()
 
         self.model = self._initialize_model()
-        self.results_dir = os.path.join("results", self.llm_id_safe, self.model_type)
+
+        # Wandb configuration
+        self.wandb_project = wandb_project
+        self.wandb_entity = wandb_entity
+        self.wandb_run_name = wandb_run_name
+        self.wandb_tags = wandb_tags or []
+        self.disable_wandb = disable_wandb
+        self.wandb_run = None
+        self.wandb_initialized = False
+
+        self.base_dir = os.getenv("AMLT_BLOB_ROOT_DIR")
+        if self.base_dir is None:
+            print('AMLT_BLOB_ROOT_DIR is not set, likely we are using development mode, using current directory')
+            self.base_dir = os.getcwd()
+        else:
+            self.base_dir = os.path.join(self.base_dir, "juncheng","OpenTSLM")
+        self.results_dir = os.path.join(self.base_dir, "results", self.llm_id_safe, self.model_type)
         self._create_results_dir()
 
     def _get_device(self) -> str:
@@ -161,6 +191,119 @@ class CurriculumTrainer:
             return "mps"
         else:
             return "cpu"
+
+    def _init_wandb(self, stage_name: str = None, resume: bool = False):
+        """Initialize wandb for tracking experiments."""
+        if self.disable_wandb or (dist.is_initialized() and self.rank != 0):
+            return
+
+        try:
+            # Build a fresh run name per stage without mutating the base name
+            base_run_name = self.wandb_run_name
+            if not base_run_name:
+                timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+                base_run_name = f"{self.model_type}_{self.llm_id_safe}_{timestamp}"
+
+            stage_run_name = f"{base_run_name}_{stage_name}" if stage_name else base_run_name
+
+            # Prepare tags
+            tags = self.wandb_tags.copy()
+            tags.extend([self.model_type, self.llm_id_safe])
+            if stage_name:
+                tags.append(stage_name)
+            if self.world_size > 1:
+                tags.append("distributed")
+
+            # Initialize wandb
+            self.wandb_run = wandb.init(
+                project=self.wandb_project,
+                entity=self.wandb_entity,
+                name=stage_run_name,
+                tags=tags,
+                resume=resume,
+                config={
+                    "model_type": self.model_type,
+                    "llm_id": self.llm_id,
+                    "device": self.device,
+                    "world_size": self.world_size,
+                    "rank": self.rank,
+                    "gradient_checkpointing": self.gradient_checkpointing,
+                    "stage": stage_name,
+                }
+            )
+            self.wandb_initialized = True
+            
+            if self.rank == 0:
+                print(f"🔬 Wandb initialized: {self.wandb_run.url}")
+                
+        except Exception as e:
+            if self.rank == 0:
+                print(f"⚠️  Failed to initialize wandb: {e}")
+                print("   Continuing without wandb logging...")
+            self.disable_wandb = True
+
+    def _log_wandb_metrics(self, metrics: Dict[str, Any], step: int = None, prefix: str = ""):
+        """Log metrics to wandb."""
+        if not self.wandb_initialized or self.disable_wandb:
+            return
+
+        try:
+            # Add prefix to metric names
+            if prefix:
+                metrics = {f"{prefix}/{k}": v for k, v in metrics.items()}
+            
+            wandb.log(metrics, step=step)
+        except Exception as e:
+            if self.rank == 0:
+                print(f"⚠️  Failed to log metrics to wandb: {e}")
+
+    def _log_model_info_to_wandb(self):
+        """Log model architecture and system information to wandb."""
+        if not self.wandb_initialized or self.disable_wandb:
+            return
+
+        try:
+            model = self._get_model()
+            
+            # Count parameters
+            total_params = sum(p.numel() for p in model.parameters())
+            trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+            
+            # Log model information
+            model_info = {
+                "model/total_parameters": total_params,
+                "model/trainable_parameters": trainable_params,
+                "model/parameter_ratio": trainable_params / total_params if total_params > 0 else 0,
+                "model/model_type": self.model_type,
+                "model/llm_id": self.llm_id,
+                "system/device": self.device,
+                "system/world_size": self.world_size,
+                "system/rank": self.rank,
+            }
+            
+            # Add GPU memory info if available
+            if torch.cuda.is_available():
+                model_info.update({
+                    "system/gpu_memory_allocated": torch.cuda.memory_allocated() / 1024**3,  # GB
+                    "system/gpu_memory_reserved": torch.cuda.memory_reserved() / 1024**3,   # GB
+                    "system/gpu_count": torch.cuda.device_count(),
+                })
+            
+            wandb.log(model_info, step=0)
+            
+        except Exception as e:
+            if self.rank == 0:
+                print(f"⚠️  Failed to log model info to wandb: {e}")
+
+    def _finish_wandb(self):
+        """Finish wandb run."""
+        if self.wandb_initialized and not self.disable_wandb:
+            try:
+                wandb.finish()
+                self.wandb_initialized = False
+            except Exception as e:
+                if self.rank == 0:
+                    print(f"⚠️  Failed to finish wandb run: {e}")
 
     def _initialize_model(self):
         """Initialize the specified model type."""
@@ -210,6 +353,7 @@ class CurriculumTrainer:
             os.makedirs(stage_dir, exist_ok=True)
             os.makedirs(os.path.join(stage_dir, "checkpoints"), exist_ok=True)
             os.makedirs(os.path.join(stage_dir, "results"), exist_ok=True)
+        print(f"Created results directory: {self.results_dir}")
 
     def _get_optimizer(
         self,
@@ -403,6 +547,38 @@ class CurriculumTrainer:
         # Try to save with error handling
         try:
             torch.save(checkpoint, checkpoint_path)
+            
+            # Log checkpoint as wandb artifact
+            # if self.wandb_initialized and not self.disable_wandb:
+            #     try:
+            #         artifact = wandb.Artifact(
+            #             name=f"{stage}_checkpoint_epoch_{epoch}",
+            #             type="model_checkpoint",
+            #             metadata={
+            #                 "stage": stage,
+            #                 "epoch": epoch,
+            #                 "val_loss": val_loss,
+            #                 "model_type": self.model_type,
+            #                 "llm_id": self.llm_id,
+            #                 "checkpoint_path": checkpoint_path,
+            #                 "checkpoint_size_gb": sum(p.numel() * p.element_size() for p in self._get_model().parameters()) / (1024**3),
+            #             }
+            #         )
+            #         artifact.add_file(checkpoint_path)
+            #         wandb.log_artifact(artifact)
+                    
+            #         # Also log checkpoint path as a metric for easy reference
+            #         wandb.log({
+            #             "checkpoint/path": checkpoint_path,
+            #             "checkpoint/epoch": epoch,
+            #             "checkpoint/val_loss": val_loss,
+            #             "checkpoint/stage": stage
+            #         }, step=epoch)
+                    
+            #     except Exception as e:
+            #         if self.rank == 0:
+            #             print(f"⚠️  Failed to log checkpoint artifact to wandb: {e}")
+                        
         except Exception as e:
             if self.rank == 0:
                 print(f"❌ Failed to save checkpoint: {e}")
@@ -781,6 +957,7 @@ class CurriculumTrainer:
                                 result["ecg_id"] = sample["ecg_id"]
                             if "correct_answer" in sample:
                                 result["correct_answer"] = sample["correct_answer"]
+
                         results.append(result)
                         # Stream write each result immediately to per-rank file
                         results_fp.write(json.dumps(result, ensure_ascii=False) + "\n")
@@ -821,7 +998,11 @@ class CurriculumTrainer:
                     print(f"Merged per-rank predictions into: {final_results_file}")
             finally:
                 pass
+
+        # Report test loss as NaN since we skip explicit loss computation during evaluation
+        # Before, we were computing the loss explicitly, but this required to run the model twice, once for loss and once for predictions.
         avg_test_loss = float("nan")
+
         # Calculate stage-specific metrics
         metrics = {"test_loss": avg_test_loss}
         if epoch is not None:
@@ -843,6 +1024,7 @@ class CurriculumTrainer:
                             continue
                 additional_metrics = metric_func(predictions, gold_answers)
                 metrics.update(additional_metrics)
+
         # Save results only on rank 0 (or when not distributed)
         if (not dist.is_initialized()) or (self.rank == 0):
             # Save metrics
@@ -861,6 +1043,9 @@ class CurriculumTrainer:
                     print(f"   {metric}: {value:.4f}")
                 else:
                     print(f"   {metric}: {value}")
+            
+            # Log evaluation metrics to wandb
+            self._log_wandb_metrics(metrics, step=epoch, prefix="evaluation")
 
         # Signal other ranks that evaluation is complete
         if dist.is_initialized():
@@ -924,6 +1109,12 @@ class CurriculumTrainer:
             if self.world_size > 1:
                 print(f"   Effective batch size: {batch_size * self.world_size}")
             print()
+
+        # Initialize wandb for this stage (force a fresh run per stage)
+        self._init_wandb(stage_name=stage_name, resume=False)
+        
+        # Log model and system information
+        self._log_model_info_to_wandb()
 
         # Check if checkpoint exists when in eval_only mode
         if eval_only and not self._checkpoint_exists(stage_name):
@@ -1136,6 +1327,13 @@ class CurriculumTrainer:
                 avg_train_loss = running_loss / len(train_loader)
                 if self.rank == 0:
                     tqdm.write(f"Epoch {epoch} — train loss: {avg_train_loss:.4f}")
+                
+                # Log training metrics to wandb
+                self._log_wandb_metrics({
+                    "train_loss": avg_train_loss,
+                    "learning_rate": scheduler.get_last_lr()[0],
+                    "epoch": epoch
+                }, step=epoch, prefix="training")
 
                 # Validation
                 val_loss = 0.0
@@ -1159,6 +1357,13 @@ class CurriculumTrainer:
                 if self.rank == 0:
                     tqdm.write(f"Epoch {epoch} — val   loss: {avg_val_loss:.4f}")
                     tqdm.write(f"Epoch {epoch} — best  loss: {best_val_loss:.4f}")
+                
+                # Log validation metrics to wandb
+                self._log_wandb_metrics({
+                    "val_loss": avg_val_loss,
+                    "best_val_loss": best_val_loss,
+                    "epochs_no_improve": epochs_no_improve
+                }, step=epoch, prefix="validation")
 
                 # Save loss history for this epoch
                 self._save_loss_history(stage_name, epoch, avg_train_loss, avg_val_loss)
@@ -1231,6 +1436,9 @@ class CurriculumTrainer:
         metrics = self._evaluate_stage(
             stage_name, test_loader, stage_name, metric_func, best_epoch
         )
+
+        # Finish wandb run for this stage
+        self._finish_wandb()
 
         return metrics
 
@@ -1458,6 +1666,33 @@ class CurriculumTrainer:
             print(f"\n🎉 Curriculum Learning Complete!")
             print(f"📁 All results saved to: {self.results_dir}/")
             print(f"📊 Overall results: {overall_results_file}")
+            
+            # Log overall curriculum results to wandb
+            if self.wandb_initialized and not self.disable_wandb:
+                try:
+                    # Create a summary table of all stage results
+                    summary_data = []
+                    for stage, metrics in results.items():
+                        row = {"stage": stage}
+                        for metric, value in metrics.items():
+                            if isinstance(value, (int, float)):
+                                row[metric] = value
+                        summary_data.append(row)
+                    
+                    # Log summary table
+                    if summary_data:
+                        table = wandb.Table(dataframe=pd.DataFrame(summary_data))
+                        wandb.log({"curriculum_summary": table})
+                    
+                    # Log individual stage metrics
+                    for stage, metrics in results.items():
+                        stage_metrics = {f"final/{stage}_{k}": v for k, v in metrics.items() 
+                                       if isinstance(v, (int, float))}
+                        if stage_metrics:
+                            wandb.log(stage_metrics)
+                            
+                except Exception as e:
+                    print(f"⚠️  Failed to log curriculum summary to wandb: {e}")
 
         return results
 
@@ -1692,12 +1927,45 @@ def main():
         "--verbose", default=False, action="store_true", help="Enable verbose logging"
     )
 
+    # Wandb arguments
+    parser.add_argument(
+        "--wandb_project",
+        type=str,
+        default="opentslm-curriculum",
+        help="Weights & Biases project name",
+    )
+    parser.add_argument(
+        "--wandb_entity",
+        type=str,
+        default=None,
+        help="Weights & Biases entity/team name",
+    )
+    parser.add_argument(
+        "--wandb_run_name",
+        type=str,
+        default=None,
+        help="Custom run name for wandb",
+    )
+    parser.add_argument(
+        "--wandb_tags",
+        nargs="+",
+        default=[],
+        help="Tags for experiment organization",
+    )
+    parser.add_argument(
+        "--disable_wandb",
+        default=False,
+        action="store_true",
+        help="Disable wandb logging",
+    )
+
     args = parser.parse_args()
 
     # Set up global logging
     set_global_verbose(args.verbose)
     logger = get_logger(verbose=args.verbose)
 
+    wandb.login(key=os.environ["WANDB_API_KEY"], relogin=True)
     # Initialize trainer
     trainer = CurriculumTrainer(
         args.model,
@@ -1707,6 +1975,11 @@ def main():
         dist_backend=args.dist_backend,
         local_rank=args.local_rank,
         llm_id=args.llm_id,
+        wandb_project=args.wandb_project,
+        wandb_entity=args.wandb_entity,
+        wandb_run_name=args.wandb_run_name,
+        wandb_tags=args.wandb_tags,
+        disable_wandb=args.disable_wandb,
     )
 
     # Run curriculum
