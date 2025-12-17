@@ -119,6 +119,7 @@ class CurriculumTrainer:
         dist_backend: str = "nccl",
         local_rank: int = int(os.environ.get("LOCAL_RANK", 0)),
         llm_id: str = None,
+        encoder_type: str = "chronos2",
         wandb_project: str = "opentslm-curriculum",
         wandb_entity: str = None,
         wandb_run_name: str = None,
@@ -149,6 +150,7 @@ class CurriculumTrainer:
                 "🚨 Warning: Using MPS, might not be fully compatible with the model. Use CUDA for best results."
             )
         self.llm_id = llm_id
+        self.encoder_type = encoder_type
         self.llm_id_safe = self._sanitize_llm_id(llm_id)
 
         # Distributed training parameters
@@ -180,7 +182,18 @@ class CurriculumTrainer:
             self.base_dir = os.getcwd()
         else:
             self.base_dir = os.path.join(self.base_dir, "juncheng","OpenTSLM")
-        self.results_dir = os.path.join(self.base_dir, "results", self.llm_id_safe, self.model_type)
+        
+        # Build results directory path
+        # For OpenTSLMFlamingo, include encoder_type in the path
+        if self.model_type == "OpenTSLMFlamingo":
+            self.results_dir = os.path.join(
+                self.base_dir, "results", self.llm_id_safe, self.model_type, self.encoder_type
+            )
+        else:
+            # For OpenTSLMSP, encoder_type is not applicable
+            self.results_dir = os.path.join(
+                self.base_dir, "results", self.llm_id_safe, self.model_type
+            )
         self._create_results_dir()
 
     def _get_device(self) -> str:
@@ -209,27 +222,34 @@ class CurriculumTrainer:
             # Prepare tags
             tags = self.wandb_tags.copy()
             tags.extend([self.model_type, self.llm_id_safe])
+            if self.model_type == "OpenTSLMFlamingo":
+                tags.append(f"encoder_{self.encoder_type}")
             if stage_name:
                 tags.append(stage_name)
             if self.world_size > 1:
                 tags.append("distributed")
 
             # Initialize wandb
+            wandb_config = {
+                "model_type": self.model_type,
+                "llm_id": self.llm_id,
+                "device": self.device,
+                "world_size": self.world_size,
+                "rank": self.rank,
+                "gradient_checkpointing": self.gradient_checkpointing,
+                "stage": stage_name,
+            }
+            # Add encoder_type to config for OpenTSLMFlamingo
+            if self.model_type == "OpenTSLMFlamingo":
+                wandb_config["encoder_type"] = self.encoder_type
+            
             self.wandb_run = wandb.init(
                 project=self.wandb_project,
                 entity=self.wandb_entity,
                 name=stage_run_name,
                 tags=tags,
                 resume=resume,
-                config={
-                    "model_type": self.model_type,
-                    "llm_id": self.llm_id,
-                    "device": self.device,
-                    "world_size": self.world_size,
-                    "rank": self.rank,
-                    "gradient_checkpointing": self.gradient_checkpointing,
-                    "stage": stage_name,
-                }
+                config=wandb_config,
             )
             self.wandb_initialized = True
             
@@ -316,6 +336,7 @@ class CurriculumTrainer:
                 gradient_checkpointing=self.gradient_checkpointing,
                 llm_id=self.llm_id,
                 device=self.device,
+                encoder_type=self.encoder_type,
             ).to(self.device)
         else:
             raise ValueError(f"Unknown model type: {self.model_type}")
@@ -1898,6 +1919,13 @@ def main():
         default="meta-llama/Llama-3.2-1B",
         help="LLM model ID for OpenTSLMFlamingo (e.g., 'google/medgemma-2b', 'meta-llama/Llama-3.2-1B')",
     )
+    parser.add_argument(
+        "--encoder_type",
+        type=str,
+        choices=["cnn", "chronos2"],
+        default="chronos2",
+        help="Encoder type for OpenTSLMFlamingo: 'cnn' or 'chronos2'",
+    )
 
     # Distributed training arguments
     parser.add_argument(
@@ -1975,6 +2003,7 @@ def main():
         dist_backend=args.dist_backend,
         local_rank=args.local_rank,
         llm_id=args.llm_id,
+        encoder_type=args.encoder_type,
         wandb_project=args.wandb_project,
         wandb_entity=args.wandb_entity,
         wandb_run_name=args.wandb_run_name,

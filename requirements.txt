@@ -9,7 +9,7 @@ scikit-learn
 torchinfo
 transformers
 chronos-forecasting
-huggingface-hub
+huggingface-hub==0.36.0
 datasets
 peft
 requests
@@ -19,3 +19,5 @@ einops-exts
 pyvim
 openai
 wfdb
+wandb
+dotenv
