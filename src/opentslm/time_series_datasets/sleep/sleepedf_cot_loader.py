@@ -10,6 +10,7 @@ from typing import Tuple, Dict
 import ast
 import urllib.request
 from opentslm.time_series_datasets.constants import RAW_DATA
+from opentslm.time_series_datasets.dist_utils import is_main_process, synchronize_processes
 from tqdm.auto import tqdm
 from sklearn.model_selection import train_test_split
 
@@ -50,9 +51,14 @@ def ensure_sleepedf_cot_dataset():
     """
     Ensure the SleepEDF CoT dataset is available in data/sleep/.
     Download if necessary.
+    
+    In distributed training, only rank 0 downloads; others wait.
     """
     if not os.path.exists(COT_CSV):
-        download_and_extract_sleepedf()
+        if is_main_process():
+            download_and_extract_sleepedf()
+        # Wait for rank 0 to finish downloading
+        synchronize_processes()
 
 def load_sleepedf_cot_splits(seed: int = 42) -> Tuple[Dataset, Dataset, Dataset]:
     """

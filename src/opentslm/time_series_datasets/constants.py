@@ -7,8 +7,15 @@
 
 import os
 
-# Path to this file's directory
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+AMLT_BLOB_ROOT_DIR = os.getenv("AMLT_BLOB_ROOT_DIR")
+if AMLT_BLOB_ROOT_DIR is None:
+    # Path to this file's directory
+    # BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+    BASE_DIR = "/home/junchengliu/OpenTSLM_local_nogit/"
+else:
+    # BASE_DIR = "/mnt/default_storage/juncheng/OpenTSLM"
+    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # Path to raw data directory
-RAW_DATA = os.path.join(BASE_DIR, "..", "..", "data")
+RAW_DATA = os.path.join(BASE_DIR, "..", "..", "..", "data")
+# RAW_DATA = os.path.join(BASE_DIR, "data")

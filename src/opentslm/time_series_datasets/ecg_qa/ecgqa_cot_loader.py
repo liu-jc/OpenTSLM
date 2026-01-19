@@ -12,6 +12,7 @@ import os
 import zipfile
 
 from opentslm.time_series_datasets.constants import RAW_DATA as RAW_DATA_PATH
+from opentslm.time_series_datasets.dist_utils import is_main_process, synchronize_processes
 from opentslm.time_series_datasets.ecg_qa.ecgqa_loader import (
     download_ecg_qa_if_not_exists,
     download_ptbxl_if_not_exists
@@ -119,9 +120,15 @@ def download_ecg_qa_cot():
 
 
 def download_ecg_qa_cot_if_not_exists():
-    """Download ECG-QA CoT data if it doesn't exist."""
+    """Download ECG-QA CoT data if it doesn't exist.
+    
+    In distributed training, only rank 0 downloads; others wait.
+    """
     if not does_ecg_qa_cot_exist():
-        download_ecg_qa_cot()
+        if is_main_process():
+            download_ecg_qa_cot()
+        # Wait for rank 0 to finish downloading
+        synchronize_processes()
 
 
 def load_ecg_qa_cot_splits() -> Tuple[Dataset, Dataset, Dataset]:

@@ -106,8 +106,8 @@ def calculate_f1_stats(data_points, allowed_labels=None):
 
 
 # Path to your JSONL file
-file_path = "evaluation_results_openai-gpt-4o_tsqadataset.json"
-
+# file_path = "evaluation_results_openai-gpt-4o_tsqadataset.json"
+file_path = "/home/junchengliu/azure_blob_mount/juncheng/OpenTSLM/results/gemma_3_1b_pt/OpenTSLMFlamingo/chronos2/stage1_mcq/results/test_predictions.jsonl"
 # Check if file exists
 if not os.path.exists(file_path):
     print(f"File not found: {file_path}")

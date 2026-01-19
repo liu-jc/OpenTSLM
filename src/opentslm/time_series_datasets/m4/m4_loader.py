@@ -26,6 +26,7 @@ from typing import Dict, List, Literal, Optional, Tuple
 from datasets import Dataset
 from sklearn.model_selection import train_test_split
 from opentslm.time_series_datasets.constants import RAW_DATA
+from opentslm.time_series_datasets.dist_utils import is_main_process, synchronize_processes
 
 # ---------------------------
 # Constants
@@ -90,9 +91,14 @@ def ensure_m4_dataset():
     """
     Ensure the M4TimeSeriesCaptionDataset is available.
     If not present, download and extract it from the GitHub release.
+    
+    In distributed training, only rank 0 downloads; others wait.
     """
     if not os.path.exists(GENERATED_DATA_DIR):
-        download_and_extract_dataset()
+        if is_main_process():
+            download_and_extract_dataset()
+        # Wait for rank 0 to finish downloading
+        synchronize_processes()
 
 def get_data_file_path(frequency: str, file_type: str) -> str:
     """

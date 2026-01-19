@@ -11,6 +11,7 @@ import ast
 import urllib.request
 import zipfile
 from opentslm.time_series_datasets.constants import RAW_DATA
+from opentslm.time_series_datasets.dist_utils import is_main_process, synchronize_processes
 from tqdm.auto import tqdm
 import logging
 from opentslm.logger import get_logger
@@ -72,11 +73,16 @@ def ensure_har_cot_dataset():
     """
     Ensure the HAR CoT dataset is available in data/har_cot/.
     Download and extract if necessary.
+    
+    In distributed training, only rank 0 downloads; others wait.
     """
     if not (os.path.exists(HAR_COT_TRAIN_CSV) and 
             os.path.exists(HAR_COT_VAL_CSV) and 
             os.path.exists(HAR_COT_TEST_CSV)):
-        download_and_extract_har_cot()
+        if is_main_process():
+            download_and_extract_har_cot()
+        # Wait for rank 0 to finish downloading
+        synchronize_processes()
 
 def parse_time_series(series_str):
     """

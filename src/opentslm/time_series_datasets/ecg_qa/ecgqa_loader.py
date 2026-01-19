@@ -14,9 +14,24 @@ from pathlib import Path
 from typing import Tuple, Dict, List
 from datasets import Dataset
 import os
+import time
+import torch.distributed as dist
 
 from opentslm.time_series_datasets.constants import RAW_DATA as RAW_DATA_PATH
 from tqdm import tqdm
+
+
+def _is_main_process() -> bool:
+    """Check if this is the main process (rank 0) in distributed training."""
+    if dist.is_initialized():
+        return dist.get_rank() == 0
+    return True
+
+
+def _synchronize_processes():
+    """Synchronize all processes in distributed training."""
+    if dist.is_initialized():
+        dist.barrier()
 
 
 # ECG-QA Repository
@@ -93,38 +108,57 @@ def download_ptbxl():
     
     # Extract the zip file if the target directory doesn't exist
     if not os.path.exists(PTBXL_DIR):
-        print("Extracting PTB-XL dataset...")
-        import zipfile
+        print("Extracting PTB-XL dataset (this may take a while for 87k+ files)...")
+        extract_start_time = time.time()
+        temp_extract_dir = os.path.join(RAW_DATA_PATH, "temp_ptbxl_extract")
+        os.makedirs(temp_extract_dir, exist_ok=True)
         
-        with zipfile.ZipFile(ptbxl_zip_path, 'r') as zip_ref:
-            # Extract to a temporary directory first
-            temp_extract_dir = os.path.join(RAW_DATA_PATH, "temp_ptbxl_extract")
+        # Try using system unzip first (much faster than Python zipfile)
+        try:
+            print("Using system unzip command (faster)...")
+            result = subprocess.run(
+                ["unzip", "-q", "-o", ptbxl_zip_path, "-d", temp_extract_dir],
+                capture_output=True,
+                text=True,
+                check=True
+            )
+            extract_end_time = time.time()
+            extract_duration = extract_end_time - extract_start_time
+            print(f"Extraction completed using system unzip in {extract_duration:.2f} seconds ({extract_duration/60:.2f} minutes).")
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            # Fallback to Python zipfile.extractall (faster than extract one by one)
+            print("System unzip not available, using Python zipfile.extractall...")
+            import zipfile
             
-            # Get list of files to extract
-            file_list = zip_ref.namelist()
-            total_files = len(file_list)
-            
-            print(f"Extracting {total_files} files from PTB-XL dataset...")
-            from tqdm import tqdm
-            
-            # Extract with progress bar
-            for file_info in tqdm(file_list, desc="Extracting PTB-XL", unit="files"):
-                zip_ref.extract(file_info, temp_extract_dir)
-            
-            # Find the actual ptb-xl directory (it might be nested)
-            extracted_dirs = [d for d in os.listdir(temp_extract_dir) 
-                            if os.path.isdir(os.path.join(temp_extract_dir, d))]
-            
-            if extracted_dirs:
-                # Move the first directory (should be ptb-xl-1.0.3 or similar) to our target
-                source_dir = os.path.join(temp_extract_dir, extracted_dirs[0])
-                shutil.move(source_dir, PTBXL_DIR)
+            with zipfile.ZipFile(ptbxl_zip_path, 'r') as zip_ref:
+                # Get total files for progress estimation
+                file_list = zip_ref.namelist()
+                total_files = len(file_list)
+                print(f"Extracting {total_files} files (this will be faster than before)...")
                 
-                # Clean up temp directory
-                shutil.rmtree(temp_extract_dir)
-            else:
-                # If no subdirectory, move the temp directory itself
-                shutil.move(temp_extract_dir, PTBXL_DIR)
+                # Use extractall instead of extract one by one - much faster!
+                zip_ref.extractall(temp_extract_dir)
+            
+            extract_end_time = time.time()
+            extract_duration = extract_end_time - extract_start_time
+            print(f"Extraction completed using Python zipfile in {extract_duration:.2f} seconds ({extract_duration/60:.2f} minutes).")
+        
+        # Find the actual ptb-xl directory (it might be nested)
+        extracted_dirs = [d for d in os.listdir(temp_extract_dir) 
+                        if os.path.isdir(os.path.join(temp_extract_dir, d))]
+        
+        if extracted_dirs:
+            # Move the first directory (should be ptb-xl-1.0.3 or similar) to our target
+            source_dir = os.path.join(temp_extract_dir, extracted_dirs[0])
+            print(f"Moving extracted directory from {source_dir} to {PTBXL_DIR}...")
+            shutil.move(source_dir, PTBXL_DIR)
+            
+            # Clean up temp directory
+            shutil.rmtree(temp_extract_dir)
+        else:
+            # If no subdirectory, move the temp directory itself
+            print(f"Moving extracted directory to {PTBXL_DIR}...")
+            shutil.move(temp_extract_dir, PTBXL_DIR)
         
         print("PTB-XL dataset extracted successfully!")
     
@@ -151,15 +185,29 @@ def download_ptbxl():
 
 
 def download_ecg_qa_if_not_exists():
-    """Download ECG-QA repository if it doesn't exist."""
+    """Download ECG-QA repository if it doesn't exist.
+    
+    In distributed training, only rank 0 downloads; others wait.
+    """
     if not does_ecg_qa_exist():
-        clone_ecg_qa()
+        if _is_main_process():
+            print("Downloading ECG-QA repository (rank 0 only)...")
+            clone_ecg_qa()
+        # Wait for rank 0 to finish downloading
+        _synchronize_processes()
 
 
 def download_ptbxl_if_not_exists():
-    """Download PTB-XL dataset if it doesn't exist."""
+    """Download PTB-XL dataset if it doesn't exist.
+    
+    In distributed training, only rank 0 downloads; others wait.
+    """
     if not does_ptbxl_exist():
-        download_ptbxl()
+        if _is_main_process():
+            print("Downloading PTB-XL dataset (rank 0 only)...")
+            download_ptbxl()
+        # Wait for rank 0 to finish downloading
+        _synchronize_processes()
 
 
 def get_ptbxl_ecg_path(ecg_id: int) -> str:
